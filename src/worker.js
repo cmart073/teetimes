@@ -71,7 +71,44 @@ async function sendNotification(to, toName, fromName, teeTime, action) {
   }
 }
 
-async function handleAPI(request, env, path) {
+// Notify all registered users about a new tee time (except the poster)
+async function notifyAllUsers(env, teeTime) {
+  const list = await env.TEETIMES.list({ prefix: "user:" });
+  const dateStr = new Date(teeTime.date + "T00:00:00").toLocaleDateString("en-US", {
+    weekday: "long", month: "long", day: "numeric",
+  });
+
+  const subject = `⛳ ${teeTime.postedBy} posted a tee time at ${teeTime.course}`;
+  const body =
+    `${teeTime.postedBy} just posted a tee time!\n\n` +
+    `Course: ${teeTime.course}\n` +
+    `Date: ${dateStr}\n` +
+    `Time: ${formatTime12(teeTime.time)}\n` +
+    `Open spots: ${teeTime.spots}\n` +
+    (teeTime.notes ? `Notes: ${teeTime.notes}\n` : "") +
+    `\nClaim your spot: https://teetimes.cmart073.com`;
+
+  for (const key of list.keys) {
+    const user = await env.TEETIMES.get(key.name, "json");
+    if (!user || user.email === teeTime.postedByEmail) continue;
+    try {
+      await fetch("https://api.mailchannels.net/tx/v1/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email: user.email, name: user.name }] }],
+          from: { email: "noreply@cmart073.com", name: "Tee Times" },
+          subject,
+          content: [{ type: "text/plain", value: body }],
+        }),
+      });
+    } catch (e) {
+      console.error(`Email to ${user.name} failed:`, e);
+    }
+  }
+}
+
+async function handleAPI(request, env, path, ctx) {
   // GET /api/teetimes
   if (path === "/api/teetimes" && request.method === "GET") {
     const list = await env.TEETIMES.list({ prefix: "tt:" });
@@ -116,6 +153,9 @@ async function handleAPI(request, env, path) {
     await env.TEETIMES.put(`tt:${id}`, JSON.stringify(teeTime), {
       expiration: Math.floor(expDate.getTime() / 1000),
     });
+
+    // Notify all users about the new tee time
+    ctx.waitUntil(notifyAllUsers(env, teeTime));
 
     return json(teeTime, 201);
   }
@@ -196,7 +236,7 @@ export default {
 
     // API routes
     if (path.startsWith("/api/")) {
-      const apiResponse = await handleAPI(request, env, path);
+      const apiResponse = await handleAPI(request, env, path, ctx);
       if (apiResponse) return apiResponse;
       return json({ error: "Not found" }, 404);
     }
