@@ -1,0 +1,11 @@
+name = "teetimes"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+[[kv_namespaces]]
+binding = "TEETIMES"
+id = "56b607a2f8b14452b1751aaa39bfdeeb"
+preview_id = "0294a83186b0468db98064c483472b9f"
+
+[site]
+bucket = "./public"
