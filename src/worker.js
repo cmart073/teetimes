@@ -53,27 +53,32 @@ function teeTimeBlock(teeTime, extraLines) {
 
 // Send one email to multiple recipients via MailChannels paid API
 async function sendEmail(env, recipients, subject, body) {
-  if (!recipients.length) return;
+  if (!recipients.length) {
+    console.log("[EMAIL] No recipients, skipping");
+    return;
+  }
   const to = recipients.map((r) => ({ email: r.email, name: r.name }));
+  const hasKey = !!env.MAILCHANNELS_API_KEY;
+  console.log(`[EMAIL] Sending to ${to.map(r => r.email).join(", ")} | subject: ${subject} | API key present: ${hasKey}`);
   try {
+    const payload = {
+      personalizations: [{ to }],
+      from: { email: "noreply@cmart073.com", name: "Tee Times" },
+      subject,
+      content: [{ type: "text/plain", value: body }],
+    };
     const resp = await fetch("https://api.mailchannels.net/tx/v1/send", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Api-Key": env.MAILCHANNELS_API_KEY,
       },
-      body: JSON.stringify({
-        personalizations: [{ to }],
-        from: { email: "noreply@cmart073.com", name: "Tee Times" },
-        subject,
-        content: [{ type: "text/plain", value: body }],
-      }),
+      body: JSON.stringify(payload),
     });
-    if (!resp.ok) {
-      console.error("MailChannels error:", resp.status, await resp.text());
-    }
+    const respText = await resp.text();
+    console.log(`[EMAIL] Response: ${resp.status} ${respText}`);
   } catch (e) {
-    console.error("Email send failed:", e);
+    console.error("[EMAIL] Fetch failed:", e.message || e);
   }
 }
 
