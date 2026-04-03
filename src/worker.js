@@ -26,86 +26,130 @@ function formatTime12(t) {
   return `${h12}:${m.toString().padStart(2, "0")} ${ampm}`;
 }
 
-// Email notification via MailChannels (free on Cloudflare Workers)
-async function sendNotification(to, toName, fromName, teeTime, action) {
-  const subject = action === "join"
-    ? `⛳ ${fromName} is joining your tee time!`
-    : `${fromName} left your tee time`;
+// ── MailChannels Paid API ─────────────────────────────────────────────
+// Requires env.MAILCHANNELS_API_KEY secret and DNS TXT record:
+//   _mailchannels.cmart073.com  →  v=mc1 auth=bb3bn8rbnzgfgv
 
-  const dateStr = new Date(teeTime.date + "T00:00:00").toLocaleDateString("en-US", {
+function formatDate(dateStr) {
+  return new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", {
     weekday: "long", month: "long", day: "numeric",
   });
+}
 
-  const spotsLeft = teeTime.spots - (teeTime.claims?.length || 0);
-  const groupList = [teeTime.postedBy, ...(teeTime.claims || []).map((c) => c.name)].join(", ");
+function buildGroupList(teeTime) {
+  return [teeTime.postedBy, ...(teeTime.claims || []).map((c) => c.name)].join(", ");
+}
 
-  const body =
-    action === "join"
-      ? `${fromName} just claimed a spot in your tee time!\n\n` +
-        `Course: ${teeTime.course}\n` +
-        `Date: ${dateStr}\n` +
-        `Time: ${formatTime12(teeTime.time)}\n` +
-        `Group: ${groupList}\n` +
-        `Spots remaining: ${spotsLeft}\n\n` +
-        `View at: https://teetimes.cmart073.com`
-      : `${fromName} cancelled their spot in your tee time.\n\n` +
-        `Course: ${teeTime.course}\n` +
-        `Date: ${dateStr}\n` +
-        `Time: ${formatTime12(teeTime.time)}\n` +
-        `Spots remaining: ${spotsLeft}\n\n` +
-        `View at: https://teetimes.cmart073.com`;
+function teeTimeBlock(teeTime, extraLines) {
+  const lines = [
+    `Course: ${teeTime.course}`,
+    `Date: ${formatDate(teeTime.date)}`,
+    `Time: ${formatTime12(teeTime.time)}`,
+  ];
+  if (extraLines) lines.push(...extraLines);
+  lines.push("", "View at: https://teetimes.cmart073.com");
+  return lines.join("\n");
+}
 
+// Send one email to multiple recipients via MailChannels paid API
+async function sendEmail(env, recipients, subject, body) {
+  if (!recipients.length) return;
+  const to = recipients.map((r) => ({ email: r.email, name: r.name }));
   try {
-    await fetch("https://api.mailchannels.net/tx/v1/send", {
+    const resp = await fetch("https://api.mailchannels.net/tx/v1/send", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Api-Key": env.MAILCHANNELS_API_KEY,
+      },
       body: JSON.stringify({
-        personalizations: [{ to: [{ email: to, name: toName }] }],
+        personalizations: [{ to }],
         from: { email: "noreply@cmart073.com", name: "Tee Times" },
         subject,
         content: [{ type: "text/plain", value: body }],
       }),
     });
+    if (!resp.ok) {
+      console.error("MailChannels error:", resp.status, await resp.text());
+    }
   } catch (e) {
     console.error("Email send failed:", e);
   }
 }
 
-// Notify all registered users about a new tee time (except the poster)
-async function notifyAllUsers(env, teeTime) {
-  const list = await env.TEETIMES.list({ prefix: "user:" });
-  const dateStr = new Date(teeTime.date + "T00:00:00").toLocaleDateString("en-US", {
-    weekday: "long", month: "long", day: "numeric",
-  });
-
-  const subject = `⛳ ${teeTime.postedBy} posted a tee time at ${teeTime.course}`;
-  const body =
-    `${teeTime.postedBy} just posted a tee time!\n\n` +
-    `Course: ${teeTime.course}\n` +
-    `Date: ${dateStr}\n` +
-    `Time: ${formatTime12(teeTime.time)}\n` +
-    `Open spots: ${teeTime.spots}\n` +
-    (teeTime.notes ? `Notes: ${teeTime.notes}\n` : "") +
-    `\nClaim your spot: https://teetimes.cmart073.com`;
-
-  for (const key of list.keys) {
-    const user = await env.TEETIMES.get(key.name, "json");
-    if (!user || user.email === teeTime.postedByEmail) continue;
-    try {
-      await fetch("https://api.mailchannels.net/tx/v1/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          personalizations: [{ to: [{ email: user.email, name: user.name }] }],
-          from: { email: "noreply@cmart073.com", name: "Tee Times" },
-          subject,
-          content: [{ type: "text/plain", value: body }],
-        }),
-      });
-    } catch (e) {
-      console.error(`Email to ${user.name} failed:`, e);
+// Get all group members for a tee time (owner + claimants)
+function getGroupRecipients(teeTime, excludeName) {
+  const recipients = [];
+  if (teeTime.postedBy !== excludeName) {
+    recipients.push({ name: teeTime.postedBy, email: teeTime.postedByEmail });
+  }
+  for (const c of teeTime.claims || []) {
+    if (c.name !== excludeName) {
+      recipients.push({ name: c.name, email: c.email });
     }
   }
+  return recipients;
+}
+
+// ── Notification functions ───────────────────────────────────────────
+
+// Someone claimed a spot → notify owner + all existing claimants
+async function notifySpotClaimed(env, teeTime, claimer) {
+  const spotsLeft = teeTime.spots - (teeTime.claims?.length || 0);
+  const recipients = getGroupRecipients(teeTime, claimer);
+  const subject = `⛳ ${claimer} joined the tee time at ${teeTime.course}`;
+  const body = `${claimer} just claimed a spot!\n\n` +
+    teeTimeBlock(teeTime, [
+      `Group: ${buildGroupList(teeTime)}`,
+      `Spots remaining: ${spotsLeft}`,
+    ]);
+  await sendEmail(env, recipients, subject, body);
+}
+
+// Someone cancelled → notify owner + remaining claimants
+async function notifySpotCancelled(env, teeTime, canceller) {
+  const spotsLeft = teeTime.spots - (teeTime.claims?.length || 0);
+  const recipients = getGroupRecipients(teeTime, canceller);
+  const subject = `${canceller} left the tee time at ${teeTime.course}`;
+  const body = `${canceller} cancelled their spot.\n\n` +
+    teeTimeBlock(teeTime, [
+      `Group: ${buildGroupList(teeTime)}`,
+      `Spots remaining: ${spotsLeft}`,
+    ]);
+  await sendEmail(env, recipients, subject, body);
+}
+
+// New tee time posted → notify all registered users (except poster)
+async function notifyNewTeeTime(env, teeTime) {
+  const list = await env.TEETIMES.list({ prefix: "user:" });
+  const recipients = [];
+  for (const key of list.keys) {
+    const user = await env.TEETIMES.get(key.name, "json");
+    if (user && user.email !== teeTime.postedByEmail) {
+      recipients.push({ name: user.name, email: user.email });
+    }
+  }
+  const subject = `⛳ ${teeTime.postedBy} posted a tee time at ${teeTime.course}`;
+  const body = `${teeTime.postedBy} just posted a tee time!\n\n` +
+    teeTimeBlock(teeTime, [
+      `Open spots: ${teeTime.spots}`,
+      ...(teeTime.notes ? [`Notes: ${teeTime.notes}`] : []),
+    ]);
+  await sendEmail(env, recipients, subject, body);
+}
+
+// Tee time deleted → notify everyone who was signed up
+async function notifyTeeTimeDeleted(env, teeTime) {
+  const recipients = [];
+  for (const c of teeTime.claims || []) {
+    recipients.push({ name: c.name, email: c.email });
+  }
+  if (!recipients.length) return;
+  const subject = `${teeTime.postedBy} cancelled the tee time at ${teeTime.course}`;
+  const body = `${teeTime.postedBy} deleted their tee time.\n\n` +
+    teeTimeBlock(teeTime, []) +
+    `\n\nThis tee time is no longer available.`;
+  await sendEmail(env, recipients, subject, body);
 }
 
 async function handleAPI(request, env, path, ctx) {
@@ -155,7 +199,7 @@ async function handleAPI(request, env, path, ctx) {
     });
 
     // Notify all users about the new tee time
-    ctx.waitUntil(notifyAllUsers(env, teeTime));
+    ctx.waitUntil(notifyNewTeeTime(env, teeTime));
 
     return json(teeTime, 201);
   }
@@ -182,8 +226,8 @@ async function handleAPI(request, env, path, ctx) {
       await env.TEETIMES.put(`user:${name}`, JSON.stringify({ name, email }));
       await env.TEETIMES.put(`tt:${id}`, JSON.stringify(teeTime));
 
-      // Notify poster
-      await sendNotification(teeTime.postedByEmail, teeTime.postedBy, name, teeTime, "join");
+      // Notify owner + all existing claimants
+      ctx.waitUntil(notifySpotClaimed(env, teeTime, name));
 
       return json(teeTime);
     }
@@ -192,7 +236,8 @@ async function handleAPI(request, env, path, ctx) {
       teeTime.claims = (teeTime.claims || []).filter((c) => c.name !== name);
       await env.TEETIMES.put(`tt:${id}`, JSON.stringify(teeTime));
 
-      await sendNotification(teeTime.postedByEmail, teeTime.postedBy, name, teeTime, "leave");
+      // Notify owner + remaining claimants
+      ctx.waitUntil(notifySpotCancelled(env, teeTime, name));
 
       return json(teeTime);
     }
@@ -207,6 +252,10 @@ async function handleAPI(request, env, path, ctx) {
     if (!teeTime) return json({ error: "Not found" }, 404);
     if (teeTime.postedBy !== body.name) return json({ error: "Not authorized" }, 403);
     await env.TEETIMES.delete(`tt:${id}`);
+
+    // Notify everyone who was signed up
+    ctx.waitUntil(notifyTeeTimeDeleted(env, teeTime));
+
     return json({ success: true });
   }
 
