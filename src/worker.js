@@ -248,6 +248,45 @@ async function handleAPI(request, env, path, ctx) {
     }
   }
 
+  // POST /api/teetimes/:id/add-guest — owner manually adds a guest
+  const addGuestMatch = path.match(/^\/api\/teetimes\/([^/]+)\/add-guest$/);
+  if (addGuestMatch && request.method === "POST") {
+    const id = addGuestMatch[1];
+    const body = await request.json();
+    const { guestName, requestedBy } = body;
+
+    const teeTime = await env.TEETIMES.get(`tt:${id}`, "json");
+    if (!teeTime) return json({ error: "Not found" }, 404);
+    if (teeTime.postedBy !== requestedBy) return json({ error: "Only the poster can add guests" }, 403);
+
+    const spotsLeft = teeTime.spots - (teeTime.claims?.length || 0);
+    if (spotsLeft <= 0) return json({ error: "No spots left" }, 400);
+    if (teeTime.claims?.some((c) => c.name === guestName)) return json({ error: "Already in the group" }, 400);
+    if (teeTime.postedBy === guestName) return json({ error: "You're already in the group" }, 400);
+
+    teeTime.claims = teeTime.claims || [];
+    teeTime.claims.push({ name: guestName, manual: true, addedBy: requestedBy, claimedAt: new Date().toISOString() });
+
+    await env.TEETIMES.put(`tt:${id}`, JSON.stringify(teeTime));
+    return json(teeTime);
+  }
+
+  // DELETE /api/teetimes/:id/remove-guest — owner removes a guest they added
+  const removeGuestMatch = path.match(/^\/api\/teetimes\/([^/]+)\/remove-guest$/);
+  if (removeGuestMatch && request.method === "DELETE") {
+    const id = removeGuestMatch[1];
+    const body = await request.json();
+    const { guestName, requestedBy } = body;
+
+    const teeTime = await env.TEETIMES.get(`tt:${id}`, "json");
+    if (!teeTime) return json({ error: "Not found" }, 404);
+    if (teeTime.postedBy !== requestedBy) return json({ error: "Only the poster can remove guests" }, 403);
+
+    teeTime.claims = (teeTime.claims || []).filter((c) => c.name !== guestName);
+    await env.TEETIMES.put(`tt:${id}`, JSON.stringify(teeTime));
+    return json(teeTime);
+  }
+
   // DELETE /api/teetimes/:id
   const deleteMatch = path.match(/^\/api\/teetimes\/([^/]+)$/);
   if (deleteMatch && request.method === "DELETE") {
@@ -410,6 +449,18 @@ const HTML = `<!DOCTYPE html>
     async function deleteTeeTime(id) {
       try { const r=await fetch(API+'/teetimes/'+id,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:state.user.name})}); if(r.ok){ state.modal=null; await fetchTeeTimes(); }} catch(e){ console.error(e); }
     }
+    async function addGuest(id, guestName) {
+      try {
+        const r=await fetch(API+'/teetimes/'+id+'/add-guest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guestName,requestedBy:state.user.name})});
+        if(r.ok){ const updated=await r.json(); state.modal={type:'detail',teeTime:updated}; await fetchTeeTimes(); }
+      } catch(e){ console.error(e); }
+    }
+    async function removeGuest(id, guestName) {
+      try {
+        const r=await fetch(API+'/teetimes/'+id+'/remove-guest',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({guestName,requestedBy:state.user.name})});
+        if(r.ok){ const updated=await r.json(); state.modal={type:'detail',teeTime:updated}; await fetchTeeTimes(); }
+      } catch(e){ console.error(e); }
+    }
 
     // ---- Render ----
     function h(tag, attrs, ...children) {
@@ -565,9 +616,32 @@ const HTML = `<!DOCTYPE html>
       modal.appendChild(h('div',{style:{fontSize:'12px',letterSpacing:'2px',color:'#555',textTransform:'uppercase',marginBottom:'10px'}},'The Group'));
       const groupDiv=h('div',{style:{display:'flex',gap:'8px',flexWrap:'wrap',marginBottom:'20px'}});
       groupDiv.appendChild(h('div',{className:'group-chip',style:{background:color.bg,border:'1px solid '+color.border,color:color.text,fontWeight:'600'}},tt.postedBy+' ★'));
-      (tt.claims||[]).forEach(c=>groupDiv.appendChild(h('div',{className:'group-chip',style:{background:'#1a2a1a',border:'1px solid #2d5e3f',color:'#7fdb98',fontWeight:'500'}},c.name)));
+      (tt.claims||[]).forEach(c=>{
+        const chipWrapper=h('div',{style:{display:'flex',alignItems:'center',gap:'0'}});
+        const isManual=c.manual;
+        const chip=h('div',{className:'group-chip',style:{background:isManual?'#1a2a2a':'#1a2a1a',border:'1px solid '+(isManual?'#2d4a5e':'#2d5e3f'),color:isManual?'#7fb8e8':'#7fdb98',fontWeight:'500',borderRadius:isOwner&&!past?'8px 0 0 8px':'8px'}},c.name+(isManual?' (guest)':''));
+        chipWrapper.appendChild(chip);
+        if(isOwner&&!past) {
+          const removeBtn=h('button',{style:{background:'#2a1a1a',border:'1px solid '+(isManual?'#2d4a5e':'#2d5e3f'),borderLeft:'none',borderRadius:'0 8px 8px 0',color:'#e87f7f',padding:'8px 8px',fontSize:'12px',cursor:'pointer',fontFamily:'inherit',lineHeight:'1'},onClick:async(e)=>{e.stopPropagation();if(isManual){await removeGuest(tt.id,c.name);}else{await removeGuest(tt.id,c.name);}}},'✕');
+          chipWrapper.appendChild(removeBtn);
+        }
+        groupDiv.appendChild(chipWrapper);
+      });
       for(let i=0;i<spotsLeft;i++) groupDiv.appendChild(h('div',{className:'group-chip',style:{background:'#111',border:'1px dashed #333',color:'#444'}},'Open'));
       modal.appendChild(groupDiv);
+
+      // Add Guest (owner only)
+      if(isOwner&&!past&&spotsLeft>0) {
+        let guestVal='';
+        const addGuestDiv=h('div',{style:{display:'flex',gap:'8px',marginBottom:'16px'}});
+        const guestInput=h('input',{className:'input',placeholder:'Add guest name...',style:{flex:'1',marginBottom:'0'}});
+        guestInput.addEventListener('input',e=>{guestVal=e.target.value;});
+        guestInput.addEventListener('keydown',async e=>{if(e.key==='Enter'&&guestVal.trim()){await addGuest(tt.id,guestVal.trim());}});
+        const addBtn=h('button',{style:{background:'#1a2a3a',color:'#7fb8e8',border:'1px solid #2d4a5e',borderRadius:'8px',padding:'12px 16px',fontSize:'13px',fontWeight:'600',cursor:'pointer',fontFamily:'inherit',whiteSpace:'nowrap'},onClick:async()=>{if(guestVal.trim()){await addGuest(tt.id,guestVal.trim());}}},'+ Add');
+        addGuestDiv.appendChild(guestInput);
+        addGuestDiv.appendChild(addBtn);
+        modal.appendChild(addGuestDiv);
+      }
 
       // Actions
       if(!past) {
